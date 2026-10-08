@@ -646,6 +646,7 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        num_finishing_reqs = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
@@ -664,6 +665,8 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                if not request.resumable:
+                    num_finishing_reqs += 1
                 req_index += 1
                 continue
 
@@ -907,7 +910,12 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_active_reqs:
+                # Requests certain to finish no longer count as active, but still
+                # hold a model-runner slot until reported in finished_req_ids.
+                if (
+                    num_running >= self.max_num_running_reqs
+                    or num_running - num_finishing_reqs >= self.max_num_active_reqs
+                ):
                     break
 
                 request = request_queue.peek_request()

@@ -811,3 +811,47 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+@pytest.mark.parametrize("max_tokens", [1, 3])
+@pytest.mark.parametrize("max_num_active_seqs", [None, 1])
+def test_admit_behind_request_certain_to_finish(
+    max_tokens: int, max_num_active_seqs: int | None
+):
+    """A running request whose last token is in flight is not scheduled again,
+    so it should not block admission. It still holds its runner slot until
+    finished_req_ids reaches the worker, so admission needs a spare slot
+    (max_num_active_seqs < max_num_seqs); otherwise the step stays empty.
+    """
+    from .test_worker_slot_overflow import WorkerSlots
+
+    max_num_seqs = 2
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=max_num_seqs,
+        max_num_active_seqs=max_num_active_seqs,
+        use_v2_model_runner=True,
+    )
+    num_active = max_num_active_seqs or max_num_seqs
+    num_requests = 3 * num_active
+    for req in create_requests(num_requests=num_requests, max_tokens=max_tokens):
+        scheduler.add_request(req)
+
+    slots = WorkerSlots(max_num_seqs)
+    tokens_per_step: list[int] = []
+    schedule = scheduler.schedule
+
+    def schedule_and_check_slots(*args, **kwargs):
+        scheduler_output = schedule(*args, **kwargs)
+        slots.apply(scheduler_output)
+        tokens_per_step.append(scheduler_output.total_num_scheduled_tokens)
+        return scheduler_output
+
+    scheduler.schedule = schedule_and_check_slots
+    PipelinedEngine(scheduler, queue_size=2).run()
+
+    assert scheduler.get_num_unfinished_requests() == 0
+    last_work_step = max(i for i, n in enumerate(tokens_per_step) if n)
+    num_bubbles = tokens_per_step[:last_work_step].count(0)
+    expected_bubbles = 0 if max_num_active_seqs else num_requests // num_active - 1
+    assert num_bubbles == expected_bubbles, tokens_per_step
